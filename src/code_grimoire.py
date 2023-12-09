@@ -1,16 +1,24 @@
+import datetime
+import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from github import Github
-from github.GithubException import RateLimitExceededException, GithubException
+from threading import Lock
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(threadName)s: %(message)s')
 
 class CodeGrimoire:
     def __init__(self, auth):
         self.total_lines = None
         self.github = Github(auth)
         self.user = self.github.get_user()
-        self.language_stats = {}
+        self.repos_languages = {}
         self.init_language_counters()
         self.extension_to_language = self.create_extension_to_language_map()
+        self.rate_limit_lock = Lock()
+        self.progress_lock = Lock()
+        self.progress = {}
 
     @staticmethod
     def create_extension_to_language_map():
@@ -66,17 +74,23 @@ class CodeGrimoire:
         }
 
     def analyze_repos(self):
-        for repo in self.fetch_relevant_repos():
-            try:
-                self.process_repository(repo)
-            except RateLimitExceededException:
-                print("Rate limit exceeded, waiting to reset...")
-                self.check_rate_limit()
-            except GithubException as e:
-                print(f"GitHub Exception for repository {repo.name}: {e}")
-            except Exception as e:
-                print(f"Error processing repository {repo.name}: {e}")
-        self.display_results()
+        repos = self.fetch_relevant_repos()
+        total_repos = len(repos)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_repo = {executor.submit(self.process_repository, repo): repo for repo in repos}
+            while not all(future.done() for future in future_to_repo):
+                self.log_progress(total_repos)
+                time.sleep(5)  # Adjust the sleep time as needed
+            self.log_progress(total_repos)  # Final progress update
+
+    def update_progress(self, repo_name, status):
+        with self.progress_lock:
+            self.progress[repo_name] = status
+
+    def log_progress(self, total_repos):
+        with self.progress_lock:
+            completed = sum(1 for status in self.progress.values() if status == "Completed")
+            logging.info(f"Progress: {completed}/{total_repos} repositories completed")
 
     def fetch_relevant_repos(self):
         owned_repos = self.user.get_repos(type='owner')
@@ -84,19 +98,34 @@ class CodeGrimoire:
         return set(owned_repos).union(set(collaborated_repos))
 
     def process_repository(self, repo):
-        start_time = time.time()
-        print(f"Analyzing repository: {repo.name}")
+        self.update_progress(repo.name, "Started")
         self.check_rate_limit()
+        self.repos_languages[repo.name] = set()  # Initialize the set of languages for this repo
+        start_time = datetime.datetime.now()
         try:
             contents = repo.get_contents("")
             self.process_contents(contents, repo, start_time)
         except Exception as e:
-            print(f"Error processing repository {repo.name}: {e}")
+            logging.debug(f"Error processing repository {repo.name}: {e}")
+        self.check_rate_limit()
+        self.update_progress(repo.name, "Completed")
+
+    def check_rate_limit(self):
+        with self.rate_limit_lock:
+            rate_limit = self.github.get_rate_limit()
+            remaining = rate_limit.core.remaining
+            reset_time = rate_limit.core.reset
+            if remaining < 10:
+                pause_duration = (reset_time - time.time()).total_seconds() + 10
+                logging.warning(f"Pausing for {pause_duration} seconds due to rate limit...")
+                time.sleep(pause_duration)
 
     def process_contents(self, contents, repo, start_time):
         for file_content in contents:
-            if time.time() - start_time > 60:
-                print(f"Skipping repository {repo.name} due to timeout after 60 seconds")
+            current_time = datetime.datetime.now()
+            elapsed_time = (current_time - start_time).total_seconds()
+            if elapsed_time > 60:
+                logging.debug(f"Skipping repository {repo.name} due to timeout after 60 seconds")
                 break
 
             if file_content.type == "dir":
@@ -106,11 +135,14 @@ class CodeGrimoire:
                 file_extension = file_content.name.split('.')[-1].lower()
 
                 language = self.extension_to_language.get(file_extension)
-                if language and language in self.total_lines:
+                if language:
+                    if language not in self.total_lines:
+                        self.total_lines[language] = {"code": 0, "comments": 0}
                     self.total_lines[language]["code"] += code_lines
                     self.total_lines[language]["comments"] += comment_lines
+                    self.repos_languages[repo.name].add(language)
                 else:
-                    print(f"Unknown file type or language mapping missing for: {file_extension}")
+                    logging.debug(f"Unknown file type or language mapping missing for: {file_extension}")
 
     def parse_file(self, file_content):
         file_type = file_content.name.split('.')[-1]
@@ -129,6 +161,8 @@ class CodeGrimoire:
             "hpp": self.parse_cpp_file,  # C++ header files
             "hxx": self.parse_cpp_file, # c++ files
             "hh": self.parse_cpp_file, # c++ files
+            "cs": self.parse_csharp_file,  # c# files
+            "csx": self.parse_csharp_file,  # c# files
             "html": self.parse_html_file, # html files
             "css": self.parse_css_file, # css files
             "rs": self.parse_rust_file,  # Rust parser
@@ -140,6 +174,7 @@ class CodeGrimoire:
             "r": self.parse_r_file,  # R parser
             "sql": self.parse_sql_file,  # SQL parser
             "lua": self.parse_lua_file,  # Lua parser
+            "java": self.parse_java_file, # java parser
         }
         if file_type in parsers:
             result = parsers[file_type](file_content.decoded_content.decode("utf-8"))
@@ -183,7 +218,7 @@ class CodeGrimoire:
                 imports.add(re.match(r'^import (\w+)|^from (\w+) import', stripped_line).group(1) or re.match(
                     r'^import (\w+)|^from (\w+) import', stripped_line).group(2))
 
-        return (imports, code_lines, comment_lines)
+        return imports, code_lines, comment_lines
 
     @staticmethod
     def parse_c_file(file_content):
@@ -558,25 +593,17 @@ class CodeGrimoire:
 
         return code_lines, comment_lines
 
-
-    def check_rate_limit(self):
-        rate_limit = self.github.get_rate_limit()
-        remaining = rate_limit.core.remaining
-        reset_time = rate_limit.core.reset
-        if remaining < 10:
-            pause_duration = (reset_time - time.time()).total_seconds() + 10
-            print(f"Pausing for {pause_duration} seconds due to rate limit...")
-            time.sleep(pause_duration)
-
     def display_results(self):
+        for repo, languages in self.repos_languages.items():
+            logging.info(f"Repository '{repo}' uses languages: {', '.join(languages)}")
+        logging.info("\nOverall Language Statistics:")
         total_lines = sum(sum(lang.values()) for lang in self.total_lines.values())
         for lang, counts in self.total_lines.items():
             code_lines = counts["code"]
             comment_lines = counts["comments"]
             percentage = (code_lines / total_lines) * 100 if total_lines > 0 else 0
-            print(f"{lang}: Code lines - {code_lines}, Comment lines - {comment_lines} ({percentage:.2f}%)")
+            logging.info(f"{lang}: Code lines - {code_lines}, Comment lines - {comment_lines} ({percentage:.2f}%)")
 
 # Usage
-auth = "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"
-analyzer = CodeGrimoire(auth)
-analyzer.analyze_repos()
+# analyzer = CodeGrimoire(auth)
+# analyzer.analyze_repos()
