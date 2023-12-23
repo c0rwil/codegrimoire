@@ -8,6 +8,11 @@ from threading import Lock
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(threadName)s: %(message)s')
 
+
+class RateLimitException:
+    pass
+
+
 class CodeGrimoire:
     def __init__(self, auth):
         self.total_lines = None
@@ -76,12 +81,42 @@ class CodeGrimoire:
     def analyze_repos(self):
         repos = self.fetch_relevant_repos()
         total_repos = len(repos)
+        rate_limit_hit = False
         with ThreadPoolExecutor(max_workers=8) as executor:
             future_to_repo = {executor.submit(self.process_repository, repo): repo for repo in repos}
             while not all(future.done() for future in future_to_repo):
+                if any("Rate Limit Hit" == self.progress.get(repo.name) for repo in repos):
+                    rate_limit_hit = True
+                    break
                 self.log_progress(total_repos)
-                time.sleep(5)  # Adjust the sleep time as needed
-            self.log_progress(total_repos)  # Final progress update
+                time.sleep(5)
+            self.log_progress(total_repos)
+
+        if rate_limit_hit:
+            logging.info("Analysis ended early due to rate limit.")
+            return self.prepare_partial_results()
+        else:
+            logging.info("Analysis completed for all repositories.")
+            return self.prepare_complete_results()
+
+    def prepare_partial_results(self):
+        logging.info("Preparing partial results...")
+        partial_data = {
+            "total_lines": self.total_lines,
+            "repos_languages": self.repos_languages,
+            "progress": self.progress
+        }
+        # Here, you can add logic to save this data to a file or database if needed
+        return partial_data
+
+    def prepare_complete_results(self):
+        logging.info("Preparing complete results...")
+        complete_data = {
+            "total_lines": self.total_lines,
+            "repos_languages": self.repos_languages
+        }
+        # Similar to partial results, add logic for further processing if needed
+        return complete_data
 
     def update_progress(self, repo_name, status):
         with self.progress_lock:
@@ -98,27 +133,28 @@ class CodeGrimoire:
         return set(owned_repos).union(set(collaborated_repos))
 
     def process_repository(self, repo):
-        self.update_progress(repo.name, "Started")
-        self.check_rate_limit()
-        self.repos_languages[repo.name] = set()  # Initialize the set of languages for this repo
-        start_time = datetime.datetime.now()
         try:
-            contents = repo.get_contents("")
-            self.process_contents(contents, repo, start_time)
-        except Exception as e:
-            logging.debug(f"Error processing repository {repo.name}: {e}")
-        self.check_rate_limit()
-        self.update_progress(repo.name, "Completed")
+            self.update_progress(repo.name, "Started")
+            self.check_rate_limit()
+            self.repos_languages[repo.name] = set()  # Initialize the set of languages for this repo
+            start_time = datetime.datetime.now()
+            try:
+                contents = repo.get_contents("")
+                self.process_contents(contents, repo, start_time)
+            except Exception as e:
+                logging.debug(f"Error processing repository {repo.name}: {e}")
+            self.check_rate_limit()
+            self.update_progress(repo.name, "Completed")
+        except RateLimitException as e:
+            logging.warning(f"Rate limit hit while processing {repo.name}: {e}")
+            self.update_progress(repo.name, "Rate Limit Hit")
 
     def check_rate_limit(self):
         with self.rate_limit_lock:
             rate_limit = self.github.get_rate_limit()
             remaining = rate_limit.core.remaining
-            reset_time = rate_limit.core.reset
-            if remaining < 10:
-                pause_duration = (reset_time - time.time()).total_seconds() + 10
-                logging.warning(f"Pausing for {pause_duration} seconds due to rate limit...")
-                time.sleep(pause_duration)
+            if remaining < 10:  # Arbitrary threshold for rate limit
+                raise RateLimitException("Approaching GitHub API rate limit.")
 
     def process_contents(self, contents, repo, start_time):
         for file_content in contents:
@@ -186,7 +222,6 @@ class CodeGrimoire:
                 raise ValueError(f"Parser for {file_type} did not return a valid tuple")
         return 0, 0
 
-    @staticmethod
     def parse_python_file(file_content):
         imports = set()
         code_lines = 0
